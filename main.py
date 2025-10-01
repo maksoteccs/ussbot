@@ -1,18 +1,22 @@
 """
-Telegram Task Bot — fresh start (aiogram 2.x, sqlite3-sync via asyncio.to_thread)
+Telegram Task Bot — aiogram 3.x + APScheduler + sqlite3 (async via asyncio.to_thread)
 
-Требования:
-- Никаких сообщений в общий чат.
-- Назначение задачи делается в общем чате по реплаю; подтверждение и задача уходят в ЛС исполнителю и инициатору.
-- /menu, /mytasks, /done в группе удаляются; ответы — в ЛС.
-- Ежедневные напоминания в 10:00 по будням (Europe/Stockholm).
+Требования и поведение:
+- Бот НИЧЕГО не пишет в общий чат.
+- Назначение задачи делается в общем чате по реплаю на сообщение сотрудника командой: /assign <текст>
+  → команда удаляется в группе, ЛС уходят:
+     - исполнителю: текст задачи,
+     - инициатору: подтверждение.
+  Если у исполнителя закрыты ЛС (не писал боту) — инициатору уйдёт подсказка.
+- /menu, /mytasks, /done, /start — если вызваны в группе, удаляются и ответ уходит в ЛС инициатору.
+- Ежедневные напоминания всем исполнителям с открытыми задачами в 10:00 (Mon–Fri) Europe/Stockholm.
 
-ENV:
+ENV (.env рядом с main.py):
 BOT_TOKEN=8299026874:AAH0uKNWiiqGqi_YQl2SWDhm5qr6Z0Vrxvw
 TZ=Europe/Stockholm
 
-Зависимости:
-aiogram==2.25.1
+Зависимости (под aiogram 3.x):
+aiogram>=3.6.0
 APScheduler==3.10.4
 python-dotenv==1.0.1
 pytz==2024.1
@@ -29,17 +33,20 @@ from typing import Optional, List, Tuple
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from aiogram import Bot, Dispatcher, types
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ParseMode, ChatType
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (
+    Message,
+    CallbackQuery,
     BotCommand,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
 )
-from aiogram.utils import executor
 from aiogram.utils.markdown import quote_html
-from dotenv import load_dotenv
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # -------------------------------------------------
 # Config
@@ -131,10 +138,12 @@ async def distinct_open_assignees() -> List[int]:
     return await asyncio.to_thread(_distinct_open_assignees_sync)
 
 # -------------------------------------------------
-# Bot setup
+# Bot & Router (aiogram 3.x)
 # -------------------------------------------------
-bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
-dp = Dispatcher(bot)
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
 
 # -------------------------------------------------
 # Utilities
@@ -145,23 +154,19 @@ class Ctx:
 
 ctx = Ctx(tz=pytz.timezone(TZ))
 
-async def safe_delete(message: types.Message):
-    """Try to delete user's command to keep the group clean."""
+async def safe_delete(message: Message):
+    """Try to delete user's message to keep group clean."""
     try:
         await message.delete()
     except Exception:
         pass  # not admin / can't delete here
 
-# -------------------------------------------------
-# Menus
-# -------------------------------------------------
-def menu_kb() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("➕ Назначить задачу", callback_data="menu_assign"),
-        InlineKeyboardButton("📋 Мои задачи", callback_data="menu_mytasks"),
-    )
-    return kb
+def menu_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Назначить задачу", callback_data="menu_assign")
+    kb.button(text="📋 Мои задачи", callback_data="menu_mytasks")
+    kb.adjust(2)
+    return kb.as_markup()
 
 async def send_menu_dm(user_id: int):
     text = (
@@ -173,57 +178,52 @@ async def send_menu_dm(user_id: int):
     await bot.send_message(user_id, text, reply_markup=menu_kb(), disable_web_page_preview=True)
 
 # -------------------------------------------------
-# Commands
+# Handlers (aiogram 3.x)
 # -------------------------------------------------
-@dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message):
+@router.message(Command("start"))
+async def cmd_start(message: Message):
     await init_db()
-    # В группах — ничего не пишем, только удаляем и шлём меню в ЛС инициатору
-    if message.chat.type in (types.ChatType.GROUP, types.ChatType.SUPERGROUP):
+    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         await safe_delete(message)
         try:
             await bot.send_message(
                 message.from_user.id,
                 "Привет! Я помогаю назначать задачи в группах и напоминать сотрудникам по будням в 10:00 (Europe/Stockholm)."
-                "\nВ общий чат я ничего писать не буду — всё уходит в ЛС.",
+                "\nВ общий чат я ничего писать не буду — всё уходит в ЛС."
             )
             await send_menu_dm(message.from_user.id)
         except Exception:
             pass
         return
 
-    # В личке — приветствие и меню
     await message.answer(
         "Привет! Я помогаю назначать задачи в группах и напоминать сотрудникам по будням в 10:00 (Europe/Stockholm)."
         "\nВ общий чат я ничего писать не буду — всё уходит в ЛС."
     )
     await send_menu_dm(message.from_user.id)
 
-@dp.message_handler(commands=["menu"])
-async def cmd_menu(message: types.Message):
-    # В группах — удаляем команду и шлём меню в ЛС инициатору
-    if message.chat.type in (types.ChatType.GROUP, types.ChatType.SUPERGROUP):
+@router.message(Command("menu"))
+async def cmd_menu(message: Message):
+    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         await safe_delete(message)
         try:
             await send_menu_dm(message.from_user.id)
         except Exception:
             pass
         return
-    # В личке — показываем меню тут
     await send_menu_dm(message.chat.id)
 
-@dp.message_handler(commands=["assign"])
-async def cmd_assign(message: types.Message):
-    # Назначение допускается только в группах по реплаю. Бот не пишет в общий чат.
-    if message.chat.type not in (types.ChatType.GROUP, types.ChatType.SUPERGROUP):
+@router.message(Command("assign"))
+async def cmd_assign(message: Message, command: CommandObject):
+    # Только в группах по реплаю. В общий чат не пишем.
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.answer("Назначение задачи доступно в группах по реплаю. Откройте меню в ЛС: /menu")
         return
 
-    # Всегда удаляем триггер в группе
+    # Удаляем команду в группе
     await safe_delete(message)
 
     if not message.reply_to_message or not message.reply_to_message.from_user:
-        # Сообщаем инициатору в ЛС, не пишем в общий чат
         try:
             await bot.send_message(
                 message.from_user.id,
@@ -236,7 +236,7 @@ async def cmd_assign(message: types.Message):
     assignee = message.reply_to_message.from_user
     assignee_id = assignee.id
     assigner_id = message.from_user.id
-    task_text = message.get_args().strip()
+    task_text = (command.args or "").strip()
 
     if not task_text:
         try:
@@ -282,10 +282,10 @@ async def cmd_assign(message: types.Message):
     except Exception:
         pass
 
-@dp.message_handler(commands=["mytasks"])
-async def cmd_mytasks(message: types.Message):
+@router.message(Command("mytasks"))
+async def cmd_mytasks(message: Message):
     # В группе — удаляем и шлём список задач в ЛС
-    if message.chat.type in (types.ChatType.GROUP, types.ChatType.SUPERGROUP):
+    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         await safe_delete(message)
         uid = message.from_user.id
     else:
@@ -308,13 +308,13 @@ async def cmd_mytasks(message: types.Message):
     except Exception:
         pass
 
-@dp.message_handler(commands=["done"])
-async def cmd_done(message: types.Message):
+@router.message(Command("done"))
+async def cmd_done(message: Message, command: CommandObject):
     # В группе — удаляем команду и работаем через ЛС
-    if message.chat.type in (types.ChatType.GROUP, types.ChatType.SUPERGROUP):
+    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         await safe_delete(message)
         uid = message.from_user.id
-        args = message.get_args().strip()
+        args = (command.args or "").strip()
         try:
             if not args:
                 await bot.send_message(uid, "Укажите ID задачи: /done <id>")
@@ -323,7 +323,7 @@ async def cmd_done(message: types.Message):
             return
     else:
         uid = message.from_user.id
-        args = message.get_args().strip()
+        args = (command.args or "").strip()
 
     if not args.isdigit():
         try:
@@ -342,10 +342,10 @@ async def cmd_done(message: types.Message):
         pass
 
 # -------------------------------------------------
-# Callbacks (menu buttons)
+# Callback handlers (кнопки меню)
 # -------------------------------------------------
-@dp.callback_query_handler(lambda c: c.data == "menu_assign")
-async def cb_menu_assign(call: types.CallbackQuery):
+@router.callback_query(F.data == "menu_assign")
+async def cb_menu_assign(call: CallbackQuery):
     await call.answer()
     txt = (
         "В группе: ответьте реплаем на сообщение сотрудника и отправьте "
@@ -357,8 +357,8 @@ async def cb_menu_assign(call: types.CallbackQuery):
     except Exception:
         pass
 
-@dp.callback_query_handler(lambda c: c.data == "menu_mytasks")
-async def cb_menu_mytasks(call: types.CallbackQuery):
+@router.callback_query(F.data == "menu_mytasks")
+async def cb_menu_mytasks(call: CallbackQuery):
     await call.answer()
     tasks = await list_tasks_for_assignee(call.from_user.id, only_open=True)
     if not tasks:
@@ -377,8 +377,10 @@ async def cb_menu_mytasks(call: types.CallbackQuery):
         pass
 
 # -------------------------------------------------
-# Scheduler: daily reminders @ 10:00 Europe/Stockholm (Mon-Fri)
+# Scheduler: daily reminders @ 10:00 Europe/Stockholm (Mon–Fri)
 # -------------------------------------------------
+scheduler: Optional[AsyncIOScheduler] = None
+
 async def send_daily_reminders():
     assignees = await distinct_open_assignees()
     if not assignees:
@@ -397,20 +399,19 @@ async def send_daily_reminders():
         except Exception:
             pass
 
-scheduler: Optional[AsyncIOScheduler] = None
-
-async def on_startup(dispatcher: Dispatcher):
-    await init_db()
-
-    # Команды
+async def setup_commands():
     commands = [
-        BotCommand("menu", "Открыть меню"),
-        BotCommand("assign", "Назначить задачу (в группе по реплаю)"),
-        BotCommand("mytasks", "Мои задачи"),
-        BotCommand("done", "Закрыть задачу по ID"),
+        BotCommand(command="menu", description="Открыть меню"),
+        BotCommand(command="assign", description="Назначить задачу (в группе по реплаю)"),
+        BotCommand(command="mytasks", description="Мои задачи"),
+        BotCommand(command="done", description="Закрыть задачу по ID"),
     ]
     await bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
     await bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+
+async def on_startup():
+    await init_db()
+    await setup_commands()
 
     global scheduler
     if scheduler is None:
@@ -420,10 +421,20 @@ async def on_startup(dispatcher: Dispatcher):
         scheduler.start()
         logger.info("Scheduler started for 10:00 %s on weekdays", TZ)
 
-async def on_shutdown(dispatcher: Dispatcher):
+async def on_shutdown():
     global scheduler
     if scheduler:
         scheduler.shutdown(wait=False)
 
+# Регистрация хуков старта/остановки
+dp.startup.register(on_startup)
+dp.shutdown.register(on_shutdown)
+
+# -------------------------------------------------
+# Entrypoint
+# -------------------------------------------------
+async def main():
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
+    asyncio.run(main())
