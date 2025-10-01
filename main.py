@@ -32,7 +32,7 @@ from apscheduler.triggers.cron import CronTrigger
 import pytz
 
 # ========= CONFIG =========
-BOT_TOKEN = os.getenv("8299026874:AAH0uKNWiiqGqi_YQl2SWDhm5qr6Z0Vrxvw")  # set in env: export BOT_TOKEN=123:ABC
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # set in env: export BOT_TOKEN=123:ABC
 TZ = pytz.timezone("Europe/Stockholm")
 DATA_PATH = Path("tasks.json")
 
