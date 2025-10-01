@@ -18,7 +18,7 @@ from aiogram.types import CallbackQuery
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-BOT_TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН"
+BOT_TOKEN = "8299026874:AAH0uKNWiiqGqi_YQl2SWDhm5qr6Z0Vrxvw"
 DEFAULT_TZ = "Europe/Moscow"
 DB_PATH = "bot.db"
 
