@@ -1,28 +1,28 @@
 """
-Telegram Task Bot — aiogram 3.x + APScheduler + sqlite3 (async via asyncio.to_thread)
+Telegram Task Bot — aiogram 3.7+ + APScheduler + sqlite3 (async via asyncio.to_thread)
 
-Требования и поведение:
+Поведение:
 - Бот НИЧЕГО не пишет в общий чат.
-- Назначение задачи делается в общем чате по реплаю на сообщение сотрудника командой: /assign <текст>
-  → команда удаляется в группе, ЛС уходят:
-     - исполнителю: текст задачи,
-     - инициатору: подтверждение.
-  Если у исполнителя закрыты ЛС (не писал боту) — инициатору уйдёт подсказка.
-- /menu, /mytasks, /done, /start — если вызваны в группе, удаляются и ответ уходит в ЛС инициатору.
-- Ежедневные напоминания всем исполнителям с открытыми задачами в 10:00 (Mon–Fri) Europe/Stockholm.
+- Назначение задачи — только в группе по реплаю: /assign <текст>
+  → команда удаляется в группе; ЛС уходят:
+     • исполнителю — новая задача,
+     • инициатору — подтверждение (или подсказка, если у исполнителя закрыты ЛС).
+- /menu /mytasks /done /start, вызванные в группе, удаляются и ответ уходит в ЛС инициатору.
+- Ежедневные напоминания по будням в 10:00 (Europe/Stockholm).
 
 ENV (.env рядом с main.py):
-BOT_TOKEN=8299026874:AAH0uKNWiiqGqi_YQl2SWDhm5qr6Z0Vrxvw
+BOT_TOKEN=123456:ABC...
 TZ=Europe/Stockholm
 
-Зависимости (под aiogram 3.x):
-aiogram>=3.6.0
+Зависимости:
+aiogram>=3.7.0
 APScheduler==3.10.4
 python-dotenv==1.0.1
 pytz==2024.1
 """
 
 import asyncio
+import html
 import logging
 import os
 import sqlite3
@@ -36,6 +36,7 @@ from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatType
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
@@ -45,28 +46,24 @@ from aiogram.types import (
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
 )
-import html
-def quote_html(text: str) -> str:
-    return html.escape(text, quote=True)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# -------------------------------------------------
-# Config
-# -------------------------------------------------
+# ---------- Config ----------
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 TZ = os.getenv("TZ", "Europe/Stockholm")
-
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is not set. Put it in .env")
 
 logger = logging.getLogger("ussbot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
-# -------------------------------------------------
-# Data layer (SQLite, sync -> run in thread)
-# -------------------------------------------------
+# ---------- Helpers ----------
+def quote_html(text: str) -> str:
+    return html.escape(text, quote=True)
+
+# ---------- Data layer (sqlite3 sync -> run in thread) ----------
 DB_PATH = "tasks.db"
 
 def _connect() -> sqlite3.Connection:
@@ -139,17 +136,16 @@ def _distinct_open_assignees_sync() -> List[int]:
 async def distinct_open_assignees() -> List[int]:
     return await asyncio.to_thread(_distinct_open_assignees_sync)
 
-# -------------------------------------------------
-# Bot & Router (aiogram 3.x)
-# -------------------------------------------------
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+# ---------- Bot / Dispatcher / Router (aiogram 3.7+) ----------
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# -------------------------------------------------
-# Utilities
-# -------------------------------------------------
+# ---------- Utilities ----------
 @dataclass
 class Ctx:
     tz: pytz.BaseTzInfo
@@ -157,11 +153,10 @@ class Ctx:
 ctx = Ctx(tz=pytz.timezone(TZ))
 
 async def safe_delete(message: Message):
-    """Try to delete user's message to keep group clean."""
     try:
         await message.delete()
     except Exception:
-        pass  # not admin / can't delete here
+        pass  # not admin / can't delete
 
 def menu_kb():
     kb = InlineKeyboardBuilder()
@@ -179,9 +174,7 @@ async def send_menu_dm(user_id: int):
     )
     await bot.send_message(user_id, text, reply_markup=menu_kb(), disable_web_page_preview=True)
 
-# -------------------------------------------------
-# Handlers (aiogram 3.x)
-# -------------------------------------------------
+# ---------- Handlers ----------
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await init_db()
@@ -215,7 +208,7 @@ async def cmd_menu(message: Message):
         return
     await send_menu_dm(message.chat.id)
 
-@router.message(Command("assign"))
+@router.message(Command("assign")))
 async def cmd_assign(message: Message, command: CommandObject):
     # Только в группах по реплаю. В общий чат не пишем.
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -343,9 +336,7 @@ async def cmd_done(message: Message, command: CommandObject):
     except Exception:
         pass
 
-# -------------------------------------------------
-# Callback handlers (кнопки меню)
-# -------------------------------------------------
+# ---------- Callback handlers ----------
 @router.callback_query(F.data == "menu_assign")
 async def cb_menu_assign(call: CallbackQuery):
     await call.answer()
@@ -378,9 +369,7 @@ async def cb_menu_mytasks(call: CallbackQuery):
     except Exception:
         pass
 
-# -------------------------------------------------
-# Scheduler: daily reminders @ 10:00 Europe/Stockholm (Mon–Fri)
-# -------------------------------------------------
+# ---------- Scheduler: daily reminders @ 10:00 Europe/Stockholm (Mon–Fri) ----------
 scheduler: Optional[AsyncIOScheduler] = None
 
 async def send_daily_reminders():
@@ -428,13 +417,10 @@ async def on_shutdown():
     if scheduler:
         scheduler.shutdown(wait=False)
 
-# Регистрация хуков старта/остановки
 dp.startup.register(on_startup)
 dp.shutdown.register(on_shutdown)
 
-# -------------------------------------------------
-# Entrypoint
-# -------------------------------------------------
+# ---------- Entrypoint ----------
 async def main():
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
