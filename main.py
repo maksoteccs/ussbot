@@ -69,7 +69,7 @@ from aiogram.enums import ParseMode
 
 bot = Bot(
     BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 db = load_db()
