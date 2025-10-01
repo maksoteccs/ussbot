@@ -8,7 +8,8 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, ChatType, MessageEntityType
+from aiogram.types import Message, MessageEntityType
+from aiogram.enums import ChatType
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
