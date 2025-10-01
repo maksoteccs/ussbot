@@ -5,19 +5,24 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, MessageEntity
 from aiogram.enums import ChatType, MessageEntityType
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-BOT_TOKEN = "8299026874:AAH0uKNWiiqGqi_YQl2SWDhm5qr6Z0Vrxvw"
+BOT_TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН"
 DEFAULT_TZ = "Europe/Moscow"
 DB_PATH = "bot.db"
 
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML")
+)
 dp = Dispatcher()
 
+# === Инициализация базы данных ===
 with closing(sqlite3.connect(DB_PATH)) as conn:
     c = conn.cursor()
     c.execute("""
@@ -42,6 +47,7 @@ with closing(sqlite3.connect(DB_PATH)) as conn:
     """)
     conn.commit()
 
+# === DB-функции ===
 def db_exec(query, params=()):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
@@ -55,19 +61,36 @@ def upsert_user(tg_id, username):
     if row:
         db_exec("UPDATE users SET username=? WHERE tg_id=?", (username, tg_id))
     else:
-        db_exec("INSERT INTO users (tg_id, username, tz, weekdays_only) VALUES (?, ?, ?, 1)",
-                (tg_id, username, DEFAULT_TZ))
+        db_exec(
+            "INSERT INTO users (tg_id, username, tz, weekdays_only) VALUES (?, ?, ?, 1)",
+            (tg_id, username, DEFAULT_TZ),
+        )
+
+def attach_username_tasks_to_user(tg_id, username):
+    if not username:
+        return
+    db_exec(
+        "UPDATE tasks SET assignee_tg_id=? WHERE assignee_tg_id IS NULL AND assignee_username=?",
+        (tg_id, username),
+    )
 
 def add_task(assignee_tg_id, assignee_username, chat_id, text):
     db_exec(
-        "INSERT INTO tasks (assignee_tg_id, assignee_username, chat_id, text, created_at) VALUES (?, ?, ?, ?, ?)",
-        (assignee_tg_id, assignee_username, chat_id, text.strip(), datetime.now(timezone.utc).isoformat())
+        "INSERT INTO tasks (assignee_tg_id, assignee_username, chat_id, text, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            assignee_tg_id,
+            assignee_username,
+            chat_id,
+            text.strip(),
+            datetime.now(timezone.utc).isoformat(),
+        ),
     )
 
 def list_tasks_for_user(tg_id):
     return db_exec(
         "SELECT id, text FROM tasks WHERE is_done=0 AND assignee_tg_id=? ORDER BY id ASC",
-        (tg_id,)
+        (tg_id,),
     ).fetchall()
 
 def mark_done(task_id, tg_id):
@@ -79,10 +102,15 @@ def mark_done(task_id, tg_id):
     db_exec("UPDATE tasks SET is_done=1 WHERE id=?", (task_id,))
     return True
 
+# === Команды ===
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     upsert_user(message.from_user.id, message.from_user.username)
-    await message.answer("Привет! Я собираю задачи по @упоминанию и пришлю их тебе утром в 10:00.")
+    attach_username_tasks_to_user(message.from_user.id, message.from_user.username)
+    await message.answer(
+        "Привет! Я собираю задачи по @упоминанию и пришлю их тебе утром в 10:00.\n"
+        "Команды: /task, /list, /done <id>"
+    )
 
 @dp.message(Command("task"))
 async def cmd_task(message: Message, command: CommandObject):
@@ -110,12 +138,16 @@ async def cmd_done(message: Message, command: CommandObject):
     ok = mark_done(int(command.args), message.from_user.id)
     await message.answer("Готово ✅" if ok else "Не получилось закрыть задачу")
 
+# === Обработчик групповых сообщений (упоминания) ===
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def on_group_message(message: Message):
     if not message.text:
         return
-    entities = message.entities or []
-    mentions = [e for e in entities if e.type in {MessageEntityType.MENTION, MessageEntityType.TEXT_MENTION}]
+    entities: list[MessageEntity] = message.entities or []
+    mentions = [
+        e for e in entities
+        if e.type in {MessageEntityType.MENTION, MessageEntityType.TEXT_MENTION}
+    ]
     if not mentions:
         return
 
@@ -138,6 +170,7 @@ async def on_group_message(message: Message):
 
     await message.reply("Задача(и) добавлена(ы) ✅")
 
+# === Ежедневные напоминания ===
 async def send_daily_summaries():
     rows = db_exec("""
         SELECT DISTINCT u.tg_id
@@ -154,7 +187,7 @@ async def send_daily_summaries():
         text = "Доброе утро! Твои задачи:\n" + "\n".join(lines)
         try:
             await bot.send_message(chat_id=tg_id, text=text)
-        except:
+        except Exception:
             pass
 
 def schedule_jobs(scheduler: AsyncIOScheduler):
@@ -162,9 +195,10 @@ def schedule_jobs(scheduler: AsyncIOScheduler):
         send_daily_summaries,
         CronTrigger(hour=10, minute=0, timezone=ZoneInfo(DEFAULT_TZ)),
         id="daily_summaries",
-        replace_existing=True
+        replace_existing=True,
     )
 
+# === Запуск ===
 async def main():
     scheduler = AsyncIOScheduler(timezone=ZoneInfo(DEFAULT_TZ))
     schedule_jobs(scheduler)
