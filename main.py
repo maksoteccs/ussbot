@@ -15,7 +15,6 @@ from aiogram.types import (
     UserShared, ReplyKeyboardRemove,
     ChatMemberUpdated
 )
-)
 from aiogram.enums import ChatType, ParseMode
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
