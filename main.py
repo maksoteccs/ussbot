@@ -208,7 +208,7 @@ async def cmd_menu(message: Message):
         return
     await send_menu_dm(message.chat.id)
 
-@router.message(Command("assign")))
+@router.message(Command("assign"))
 async def cmd_assign(message: Message, command: CommandObject):
     # Только в группах по реплаю. В общий чат не пишем.
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
