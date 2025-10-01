@@ -102,7 +102,7 @@ async def cmd_list(message: Message):
     lines = [f"{r['id']}. {r['text']}" for r in rows]
     await message.answer("Твои задачи:\n" + "\n".join(lines))
 
-@dp.message(Command("done")))
+@dp.message(Command("done"))
 async def cmd_done(message: Message, command: CommandObject):
     if not command.args or not command.args.isdigit():
         await message.answer("Укажи ID задачи: /done 1")
