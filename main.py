@@ -12,7 +12,7 @@ Assumptions preserved from our previous setup:
 
 Quick start:
 1) Create .env next to this file with:
-   BOT_TOKEN=123456:ABC...
+   BOT_TOKEN=8299026874:AAH0uKNWiiqGqi_YQl2SWDhm5qr6Z0Vrxvw
    TZ=Europe/Stockholm
    SHEETS_LINK_PLAN=https://docs.google.com/spreadsheets/d/1jYQAQIYGqXc8nM1zZFrsjHB4qVwcxeZufoZjtgj4_Ck/edit?usp=sharing
 
