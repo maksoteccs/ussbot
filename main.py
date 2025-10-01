@@ -1,406 +1,370 @@
-import asyncio
-import sqlite3
-from contextlib import closing
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+# bot.py
+# Python 3.11+
+# Features:
+# - Inline "Меню" in group without typing commands (one pinned bot message with buttons)
+# - Assign tasks ONLY via menu flow (no @mentions parsing)
+# - User picker (KeyboardButtonRequestUser) — choose assignee from current chat
+# - Task text collected with ForceReply and immediately auto-deleted to keep chat clean
+# - Other users don't see your commands (bot deletes prompts; confirmations via ephemeral popups and in DMs)
+# - Same menu works in any added group and in private chat
+# - Links submenu (e.g., Google Sheets) with URL buttons
+# - Daily reminders at 10:00 Europe/Stockholm (Mon–Fri) sent to each assignee in DM with only ACTIVE tasks
+# - Simple JSON storage (tasks.json) — no external DB/hosting required; run locally via polling
 
-from aiogram import Bot, Dispatcher, F, html
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, CommandObject
+import asyncio
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message,
-    InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton, KeyboardButtonRequestUser,
-    CallbackQuery, BotCommand
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ForceReply,
+    UserShared, ReplyKeyboardRemove
 )
-from aiogram.types import BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
-from aiogram.enums import ChatType
+from aiogram.enums import ChatType, ParseMode
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+import pytz
 
-BOT_TOKEN = "8299026874:AAH0uKNWiiqGqi_YQl2SWDhm5qr6Z0Vrxvw"
-DEFAULT_TZ = "Europe/Moscow"
-DB_PATH = "bot.db"
+# ========= CONFIG =========
+BOT_TOKEN = os.getenv("8299026874:AAH0uKNWiiqGqi_YQl2SWDhm5qr6Z0Vrxvw")  # set in env: export BOT_TOKEN=123:ABC
+TZ = pytz.timezone("Europe/Stockholm")
+DATA_PATH = Path("tasks.json")
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+# Optional: allow only these group IDs. Leave empty to allow any.
+ALLOWED_GROUP_IDS = set()  # e.g., { -1001234567890 }
+
+# Example links menu — edit freely
+LINKS = [
+    ("План", "https://docs.google.com/spreadsheets/d/1jYQAQIYGqXc8nM1zZFrsjHB4qVwcxeZufoZjtgj4_Ck/edit?usp=sharing"),
+]
+
+# ========= STORAGE =========
+# Structure:
+# {
+#   "users": { "<user_id>": {"tasks": [{"text": str, "by": int, "chat": int, "ts": int, "done": bool}] } },
+#   "group_menu_messages": {"<chat_id>": <message_id>}  # to update the single menu message
+# }
+
+def load_db():
+    if DATA_PATH.exists():
+        with open(DATA_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"users": {}, "group_menu_messages": {}}
+
+
+def save_db(db):
+    with open(DATA_PATH, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+
+
+# ========= BOT =========
+bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-# ------------------ ИНИЦИАЛИЗАЦИЯ БД ------------------
-with closing(sqlite3.connect(DB_PATH)) as conn:
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER UNIQUE,
-            username TEXT,
-            tz TEXT,
-            weekdays_only INTEGER DEFAULT 1
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            assignee_tg_id INTEGER,
-            assignee_username TEXT,
-            chat_id INTEGER,
-            text TEXT,
-            is_done INTEGER DEFAULT 0,
-            created_at TEXT
-        )
-    """)
-    conn.commit()
+db = load_db()
 
-# ------------------ DB HELPERS ------------------
-def db_execute(query: str, params: tuple = ()) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute(query, params)
-        conn.commit()
+# In-memory state for ongoing assignment flows per user
+ASSIGN_STATE = {}
+# Structure ASSIGN_STATE[user_id] = {"chat_id": int, "assignee_id": int | None}
 
-def db_fetchone(query: str, params: tuple = ()):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute(query, params)
-        return c.fetchone()
 
-def db_fetchall(query: str, params: tuple = ()):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute(query, params)
-        return c.fetchall()
+# ========= KEYBOARDS =========
 
-def upsert_user(tg_id: int, username: str | None):
-    row = db_fetchone("SELECT tg_id FROM users WHERE tg_id=?", (tg_id,))
-    if row:
-        db_execute("UPDATE users SET username=? WHERE tg_id=?", (username, tg_id))
-    else:
-        db_execute(
-            "INSERT INTO users (tg_id, username, tz, weekdays_only) VALUES (?, ?, ?, 1)",
-            (tg_id, username, DEFAULT_TZ),
-        )
+def main_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📌 Назначить задачу", callback_data="assign")
+    kb.button(text="📎 Ссылки", callback_data="links")
+    kb.adjust(1)
+    return kb.as_markup()
 
-def set_user_tz(tg_id: int, tz: str):
-    db_execute("UPDATE users SET tz=? WHERE tg_id=?", (tz, tg_id))
 
-def get_user_tz(tg_id: int) -> str:
-    row = db_fetchone("SELECT tz FROM users WHERE tg_id=?", (tg_id,))
-    return row["tz"] if row and row["tz"] else DEFAULT_TZ
+def links_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for title, url in LINKS:
+        kb.row(InlineKeyboardButton(text=title, url=url))
+    kb.row(InlineKeyboardButton(text="↩️ Назад", callback_data="back_main"))
+    return kb.as_markup()
 
-def set_weekdays_only(tg_id: int, value: bool):
-    db_execute("UPDATE users SET weekdays_only=? WHERE tg_id=?", (1 if value else 0, tg_id))
 
-def get_weekdays_only(tg_id: int) -> bool:
-    row = db_fetchone("SELECT weekdays_only FROM users WHERE tg_id=?", (tg_id,))
-    return bool(row["weekdays_only"]) if row else True
-
-def add_task(assignee_tg_id: int | None, assignee_username: str | None, chat_id: int, text: str):
-    db_execute(
-        "INSERT INTO tasks (assignee_tg_id, assignee_username, chat_id, text, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (assignee_tg_id, assignee_username, chat_id, text.strip(), datetime.now(timezone.utc).isoformat()),
-    )
-
-def list_tasks_for_user(tg_id: int):
-    return db_fetchall(
-        "SELECT id, text FROM tasks WHERE is_done=0 AND assignee_tg_id=? ORDER BY id ASC",
-        (tg_id,),
-    )
-
-def mark_done(task_id: int, tg_id: int) -> bool:
-    row = db_fetchone("SELECT assignee_tg_id FROM tasks WHERE id=?", (task_id,))
-    if not row:
-        return False
-    if row["assignee_tg_id"] and row["assignee_tg_id"] != tg_id:
-        return False
-    db_execute("UPDATE tasks SET is_done=1 WHERE id=?", (task_id,))
-    return True
-
-# ------------------ УТИЛИТЫ: удаление команды и ответы в ЛС ------------------
-async def try_delete(message: Message):
-    """Удаляем команду в группах (бот должен быть админом с правом Delete messages)."""
-    try:
-        if message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
-            await message.bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
-    except Exception:
-        pass
-
-async def dm(user_id: int, text: str, **kwargs) -> bool:
-    """Отправка в личку; вернёт False, если у пользователя не открыт ЛС с ботом."""
-    try:
-        await bot.send_message(chat_id=user_id, text=text, **kwargs)
-        return True
-    except Exception:
-        return False
-
-async def reply_privately_or_hint(message: Message, text: str, **kwargs):
-    """Пробуем ответить в личку; если нельзя — даём краткую подсказку в группе и удаляем её через 5 сек."""
-    sent = await dm(message.from_user.id, text, **kwargs)
-    if sent:
-        return
-    hint = await message.answer("Напиши мне в личку: открой профиль бота и нажми Start.")
-    try:
-        await asyncio.sleep(5)
-        await hint.delete()
-    except Exception:
-        pass
-
-# ------------------ ИНЛАЙН-КНОПКИ ДЛЯ /list ------------------
-def tasks_keyboard(rows):
-    buttons = [[InlineKeyboardButton(text=f"✅ Закрыть {r['id']}", callback_data=f"done:{r['id']}")] for r in rows]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-# ------------------ MENU BUTTON (нижняя панель) ------------------
-PENDING_ASSIGN: dict[int, int] = {}  # кто -> кому назначаем (выбранный user_id)
-
-def build_menu_kb() -> ReplyKeyboardMarkup:
+def user_picker_reply_kb() -> ReplyKeyboardMarkup:
+    # One-time keyboard that opens system user picker for current chat
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="👤 Назначить пользователю", request_user=KeyboardButtonRequestUser(request_id=1))],
-            [KeyboardButton(text="➕ Назначить себе"), KeyboardButton(text="📋 Мои задачи")],
-            [KeyboardButton(text="✅ Закрыть задачу"), KeyboardButton(text="🌍 Часовой пояс")],
-            [KeyboardButton(text="📅 Будни on/off"), KeyboardButton(text="ℹ️ Помощь")],
-        ],
+        keyboard=[[KeyboardButton(text="Выбрать исполнителя из этого чата", request_user={"request_id": 1, "user_is_bot": False})]],
         resize_keyboard=True,
-        one_time_keyboard=False
+        one_time_keyboard=True
     )
 
-# ------------------ BOT COMMANDS (кнопка «Меню» у поля ввода) ------------------
-PRIVATE_COMMANDS = [
-    BotCommand(command="task",    description="Назначить себе"),
-    BotCommand(command="list",    description="Показать мои задачи"),
-    BotCommand(command="done",    description="Закрыть задачу по ID"),
-    BotCommand(command="settz",   description="Установить часовой пояс"),
-    BotCommand(command="weekdays",description="Будни on/off"),
-    BotCommand(command="help",    description="Справка"),
-]
-GROUP_COMMANDS = [
-    BotCommand(command="task",    description="Назначить себе"),
-    BotCommand(command="list",    description="Показать мои задачи"),
-    BotCommand(command="done",    description="Закрыть задачу по ID"),
-    BotCommand(command="help",    description="Справка"),
-]
-
-async def setup_bot_commands(bot: Bot):
-    await bot.set_my_commands(PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats())
-    await bot.set_my_commands(GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
-
-# ------------------ КОМАНДЫ ------------------
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    upsert_user(message.from_user.id, message.from_user.username)
-    await message.answer(
-        "Привет! Кнопка «Меню» рядом с полем ввода показывает список команд.\n"
-        "Ниже включил удобную панель для назначения задач.",
-        reply_markup=build_menu_kb()
-    )
-
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    await try_delete(message)
-    text = (
-        "📌 Как пользоваться:\n\n"
-        "• 👤 Назначить пользователю — выбери человека и отправь текст задачи одним сообщением\n"
-        "• /task <текст> — назначить себе\n"
-        "• /list — список открытых задач (закрывай кнопками)\n"
-        "• /done <id> — закрыть задачу по ID\n"
-        "• /settz <IANA_TZ> — часовой пояс (например Europe/Moscow)\n"
-        "• /weekdays on|off — напоминания только по будням\n\n"
-        "⚠️ Назначение через @упоминание отключено — используем меню."
-    )
-    await reply_privately_or_hint(message, text)
-
-@dp.message(Command("settz"))
-async def cmd_settz(message: Message, command: CommandObject):
-    await try_delete(message)
-    upsert_user(message.from_user.id, message.from_user.username)
-
-    tz = (command.args or "").strip()
+async def is_chat_member(chat_id: int, user_id: int) -> bool:
+    """Check that the selected user is a current member of the given chat."""
     try:
-        if not tz:
-            raise ValueError("empty")
-        ZoneInfo(tz)
-        set_user_tz(message.from_user.id, tz)
-        await reply_privately_or_hint(message, f"Часовой пояс обновлён на {html.quote(tz)}")
+        cm = await bot.get_chat_member(chat_id, user_id)
+        return cm.status in {"creator", "administrator", "member"}
     except Exception:
-        await reply_privately_or_hint(message, "Укажи корректный IANA TZ, например: Europe/Moscow")
+        return False
 
-@dp.message(Command("weekdays"))
-async def cmd_weekdays(message: Message, command: CommandObject):
-    await try_delete(message)
-    upsert_user(message.from_user.id, message.from_user.username)
 
-    arg = (command.args or "").strip().lower()
-    if arg not in {"on", "off"}:
-        current = "on" if get_weekdays_only(message.from_user.id) else "off"
-        await reply_privately_or_hint(message, f"Сейчас: {current}. Используй: /weekdays on|off")
+# ========= HELPERS =========
+
+def ensure_menu_message(chat_id: int) -> None:
+    """Ensure one persistent menu message exists per group chat."""
+    msg_id = db.get("group_menu_messages", {}).get(str(chat_id))
+    if msg_id:
         return
-    set_weekdays_only(message.from_user.id, arg == "on")
-    await reply_privately_or_hint(
-        message,
-        "Напоминания по будням: включены ✅" if arg == "on" else "Выходные тоже включены ✅"
-    )
+    # Post a fresh menu message
+    # Note: we do not require users to type commands; admins can run /setupmenu once.
+    # After that, the menu message lives in chat and buttons work silently.
 
-@dp.message(Command("task"))
-async def cmd_task(message: Message, command: CommandObject):
-    await try_delete(message)
-    upsert_user(message.from_user.id, message.from_user.username)
 
-    text = (command.args or "").strip()
-    if not text:
-        await reply_privately_or_hint(message, "Напиши задачу: /task <текст>")
-        return
-    add_task(message.from_user.id, message.from_user.username, message.chat.id, text)
-    await reply_privately_or_hint(message, "✅ Задача добавлена. Открой /list, чтобы посмотреть все.")
-
-@dp.message(Command("list"))
-async def cmd_list(message: Message):
-    await try_delete(message)
-    upsert_user(message.from_user.id, message.from_user.username)
-
-    rows = list_tasks_for_user(message.from_user.id)
-    if not rows:
-        await reply_privately_or_hint(message, "У тебя нет открытых задач ✨")
-        return
-
-    lines = [f"{r['id']}. {html.quote(r['text'])}" for r in rows]
-    text = "Твои задачи:\n" + "\n".join(lines)
-    await reply_privately_or_hint(message, text, reply_markup=tasks_keyboard(rows))
-
-@dp.message(Command("done"))
-async def cmd_done(message: Message, command: CommandObject):
-    await try_delete(message)
-    upsert_user(message.from_user.id, message.from_user.username)
-
-    if not command.args or not command.args.isdigit():
-        await reply_privately_or_hint(message, "Укажи ID задачи: /done <id>")
-        return
-    ok = mark_done(int(command.args), message.from_user.id)
-    await reply_privately_or_hint(message, "Готово ✅" if ok else "Не получилось закрыть задачу")
-
-# ------------------ INLINE-КНОПКИ «ЗАКРЫТЬ» (в ЛС) ------------------
-@dp.callback_query(F.data.startswith("done:"))
-async def on_done_click(callback: CallbackQuery):
-    task_id_str = callback.data.split(":", 1)[1]
-    if not task_id_str.isdigit():
-        await callback.answer("Некорректный ID", show_alert=False)
-        return
-
-    ok = mark_done(int(task_id_str), callback.from_user.id)
-    if not ok:
-        await callback.answer("Не получилось (не найдена или не твоя)", show_alert=False)
-        return
-
-    rows = list_tasks_for_user(callback.from_user.id)
-    if rows:
-        lines = [f"{r['id']}. {html.quote(r['text'])}" for r in rows]
-        text = "Твои задачи:\n" + "\n".join(lines)
-        await callback.message.edit_text(text, reply_markup=tasks_keyboard(rows))
-    else:
-        await callback.message.edit_text("Все задачи закрыты 🎉")
-    await callback.answer("Закрыто ✅", show_alert=False)
-
-# ------------------ НАЗНАЧЕНИЕ ЧЕРЕЗ ПИКЕР ПОЛЬЗОВАТЕЛЯ ------------------
-@dp.message(F.user_shared)
-async def on_user_shared(message: Message):
-    assignee_id = message.user_shared.user_id
-    PENDING_ASSIGN[message.from_user.id] = assignee_id
-
-    upsert_user(message.from_user.id, message.from_user.username)
-    upsert_user(assignee_id, None)
-
-    await message.answer("✍️ Напиши текст задачи для выбранного пользователя одним сообщением.")
-
-@dp.message(F.text == "➕ Назначить себе")
-async def menu_task_self(message: Message):
-    # Эта кнопка только подсказывает синтаксис
-    await message.answer("Напиши задачу для себя так: /task <текст задачи>")
-
-@dp.message(F.text == "📋 Мои задачи")
-async def menu_list_btn(message: Message):
-    await cmd_list(message)
-
-@dp.message(F.text == "✅ Закрыть задачу")
-async def menu_done_btn(message: Message):
-    await message.answer("Закрыть: /done <id> или кнопками в списке")
-
-@dp.message(F.text == "ℹ️ Помощь")
-async def menu_help_btn(message: Message):
-    await cmd_help(message)
-
-@dp.message(F.text == "🌍 Часовой пояс")
-async def menu_tz_btn(message: Message):
-    await message.answer("Установить часовой пояс: /settz <IANA_TZ> (например Europe/Moscow)")
-
-@dp.message(F.text == "📅 Будни on/off")
-async def menu_weekdays_btn(message: Message):
-    await message.answer("Включить/выключить напоминания только по будням: /weekdays on|off")
-
-# Следующее текстовое сообщение после выбора пользователя — текст задачи
-@dp.message(F.text)
-async def on_any_text(message: Message):
-    assignee_id = PENDING_ASSIGN.pop(message.from_user.id, None)
-    if assignee_id is None:
-        return  # не в режиме назначения через пикер
-
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer("Текст задачи пустой. Напиши сообщение с задачей.")
-        return
-
-    add_task(assignee_tg_id=assignee_id, assignee_username=None, chat_id=message.chat.id, text=text)
-    await message.answer("✅ Задача назначена выбранному пользователю.\nОткрой /list чтобы увидеть свои задачи.")
-
-# ------------------ НАПОМИНАНИЯ ------------------
-async def send_daily_summaries():
-    rows = db_fetchall("""
-        SELECT DISTINCT u.tg_id, COALESCE(u.tz, ?) AS tz, COALESCE(u.weekdays_only, 1) AS weekdays_only
-        FROM tasks t
-        JOIN users u ON u.tg_id = t.assignee_tg_id
-        WHERE t.is_done=0 AND t.assignee_tg_id IS NOT NULL
-    """, (DEFAULT_TZ,))
-    for r in rows:
-        tg_id = r["tg_id"]
-        tz = r["tz"]
-        weekdays_only = bool(r["weekdays_only"])
-        if weekdays_only and datetime.now(ZoneInfo(tz)).weekday() >= 5:  # 5,6 = Сб,Вс
-            continue
-
-        tasks = list_tasks_for_user(tg_id)
-        if not tasks:
-            continue
-
-        lines = [f"{row['id']}. {html.quote(row['text'])}" for row in tasks]
-        now_local = datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d %H:%M")
-        text = (
-            f"Доброе утро! ({now_local} {tz})\n"
-            "Твои актуальные задачи:\n" + "\n".join(lines) +
-            "\n\nЗакрывай выполненные кнопками в /list или командой /done <id>"
-        )
+async def post_or_update_menu(chat_id: int):
+    rec = db.setdefault("group_menu_messages", {})
+    msg_id = rec.get(str(chat_id))
+    if msg_id:
         try:
-            await bot.send_message(chat_id=tg_id, text=text)
+            await bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=main_menu_kb())
+            return
+        except Exception:
+            pass
+    sent = await bot.send_message(chat_id, "<b>Меню задач</b> — назначайте задачи через кнопки ниже.", reply_markup=main_menu_kb())
+    rec[str(chat_id)] = sent.message_id
+    save_db(db)
+
+
+def add_task(assignee_id: int, text: str, by_user_id: int, chat_id: int):
+    u = db.setdefault("users", {}).setdefault(str(assignee_id), {"tasks": []})
+    u["tasks"].append({
+        "text": text,
+        "by": by_user_id,
+        "chat": chat_id,
+        "ts": int(datetime.now(tz=TZ).timestamp()),
+        "done": False,
+    })
+    save_db(db)
+
+
+def get_active_tasks(user_id: int):
+    u = db.get("users", {}).get(str(user_id), {"tasks": []})
+    return [t for t in u["tasks"] if not t.get("done")]
+
+
+# ========= COMMANDS =========
+
+@dp.message(CommandStart())
+async def on_start(m: Message):
+    if m.chat.type == ChatType.PRIVATE:
+        await m.answer(
+            "Привет! Я бот для задач. Добавь меня в рабочий чат и отправь команду /setupmenu, чтобы я закрепил там кнопки.\n\n"
+            "Задачи назначаются <b>только</b> через меню: сначала выбираешь исполнителя, потом вводишь текст. Всё тихо и без засорения чата.")
+    else:
+        await post_or_update_menu(m.chat.id)
+        try:
+            await m.delete()
         except Exception:
             pass
 
-def schedule_jobs(scheduler: AsyncIOScheduler):
-    scheduler.add_job(
-        send_daily_summaries,
-        CronTrigger(hour=10, minute=0, timezone=ZoneInfo(DEFAULT_TZ)),
-        id="daily_summaries",
-        replace_existing=True,
+
+@dp.message(Command("setupmenu"))
+async def setup_menu(m: Message):
+    if m.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await m.answer("Эта команда для групп. Добавь меня в рабочий чат и пришли /setupmenu там.")
+        return
+    if ALLOWED_GROUP_IDS and m.chat.id not in ALLOWED_GROUP_IDS:
+        await m.answer("Этот чат не разрешен для меню.")
+        return
+    await post_or_update_menu(m.chat.id)
+    try:
+        await m.delete()
+    except Exception:
+        pass
+
+
+# ========= MENU CALLBACKS =========
+
+@dp.callback_query(F.data == "assign")
+async def cb_assign(c: CallbackQuery):
+    chat = c.message.chat
+    # Start assignment flow in current chat
+    ASSIGN_STATE[c.from_user.id] = {"chat_id": chat.id, "assignee_id": None}
+    await c.answer("Выбор исполнителя…", show_alert=False)
+    await bot.send_message(chat.id,
+        f"{c.from_user.full_name}, выбери исполнителя ⤵️",
+        reply_markup=user_picker_reply_kb())
+
+
+@dp.callback_query(F.data == "links")
+async def cb_links(c: CallbackQuery):
+    await c.message.edit_text("Полезные ссылки:", reply_markup=links_kb())
+    await c.answer()
+
+
+@dp.callback_query(F.data == "back_main")
+async def cb_back(c: CallbackQuery):
+    await c.message.edit_text("<b>Меню задач</b> — назначайте задачи через кнопки ниже.", reply_markup=main_menu_kb())
+    await c.answer()
+
+
+# ========= USER PICKER HANDLER =========
+# Works when someone presses the reply keyboard button with request_user
+
+@dp.message(F.user_shared)
+async def on_user_shared(m: Message):
+    shared: UserShared = m.user_shared
+    state = ASSIGN_STATE.get(m.from_user.id)
+    if not state:
+        # Not in flow — ignore and remove the keyboard
+        await m.answer("Выбор исполнителя вне контекста меню.", reply_markup=ReplyKeyboardRemove())
+        try:
+            await m.delete()
+        except Exception:
+            pass
+        return
+
+    assignee_id = shared.user_id
+    chat_id = state["chat_id"]
+
+    # Enforce membership: only users from THIS chat can be assigned
+    if not await is_chat_member(chat_id, assignee_id):
+        # Inform selector privately and clean message
+        try:
+            await bot.send_message(m.from_user.id, "❗ Нельзя назначать задачи пользователям, которых нет в этом чате. Выбери участника из текущего чата.")
+        except Exception:
+            pass
+        try:
+            await m.delete()
+        except Exception:
+            pass
+        # Keep state; they can pick again
+        return
+
+    state["assignee_id"] = assignee_id
+
+    # Ask for task text via ForceReply to keep flow tidy; we'll delete the message after capture
+    prompt = await m.answer(
+        "Напиши текст задачи (это сообщение будет скрыто)",
+        reply_markup=ForceReply(selective=True)
     )
 
-# ------------------ ЗАПУСК ------------------
+    # Clean the user_shared message quickly
+    try:
+        await m.delete()
+    except Exception:
+        pass
+
+
+# ========= CAPTURE TASK TEXT =========
+
+@dp.message(F.reply_to_message, F.reply_to_message.text.contains("Напиши текст задачи"))
+async def on_task_text(m: Message):
+    state = ASSIGN_STATE.get(m.from_user.id)
+    if not state or not state.get("assignee_id"):
+        try:
+            await m.delete()
+        except Exception:
+            pass
+        return
+
+    assignee_id = state["assignee_id"]
+    chat_id = state["chat_id"]
+    text = m.text.strip()
+
+    add_task(assignee_id, text, by_user_id=m.from_user.id, chat_id=chat_id)
+
+    # DM assignee and creator
+    try:
+        await bot.send_message(assignee_id, f"🆕 Новая задача от <b>{m.from_user.full_name}</b>:\n• {text}")
+    except Exception:
+        pass
+    try:
+        await bot.send_message(m.from_user.id, f"✅ Задача назначена пользователю <code>{assignee_id}</code>:\n• {text}")
+    except Exception:
+        pass
+
+    # Ephemeral confirmation in chat via a short message, then delete
+    conf = await bot.send_message(chat_id, "Готово. Задача назначена.")
+    await asyncio.sleep(2)
+    try:
+        await conf.delete()
+    except Exception:
+        pass
+
+    # Clean prompt and user's task text
+    try:
+        await m.delete()
+    except Exception:
+        pass
+    # Remove reply keyboard if still present
+    try:
+        await bot.send_message(chat_id, " ", reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
+
+    # Reset state
+    ASSIGN_STATE.pop(m.from_user.id, None)
+
+
+# ========= REMINDERS =========
+
+async def send_daily_reminders():
+    now = datetime.now(TZ)
+    # Mon–Fri only
+    if now.weekday() >= 5:
+        return
+
+    users = list(db.get("users", {}).keys())
+    for uid in users:
+        uid_int = int(uid)
+        tasks = get_active_tasks(uid_int)
+        if not tasks:
+            continue
+        lines = ["🗓 <b>Ежедневное напоминание</b>"]
+        for i, t in enumerate(tasks, start=1):
+            lines.append(f"{i}. {t['text']}")
+        text = "\n".join(lines)
+        try:
+            await bot.send_message(uid_int, text)
+        except Exception:
+            pass
+
+
+async def scheduler_runner():
+    sched = AsyncIOScheduler(timezone=str(TZ))
+    # Every weekday at 10:00
+    trigger = CronTrigger(day_of_week="mon-fri", hour=10, minute=0)
+    sched.add_job(send_daily_reminders, trigger)
+    sched.start()
+
+
+# ========= STARTUP =========
+
+@dp.message(Command("menu"))
+async def cmd_menu(m: Message):
+    # Fallback manual menu (we will delete the command message to keep chat clean)
+    await post_or_update_menu(m.chat.id)
+    try:
+        await m.delete()
+    except Exception:
+        pass
+
+
+async def on_startup():
+    print("Bot started @", datetime.now())
+
+
 async def main():
-    scheduler = AsyncIOScheduler(timezone=ZoneInfo(DEFAULT_TZ))
-    schedule_jobs(scheduler)
-    scheduler.start()
-
-    await setup_bot_commands(bot)
-
-    print("Бот работает...")
+    if not BOT_TOKEN:
+        raise SystemExit("Please set BOT_TOKEN env var")
+    await on_startup()
+    asyncio.create_task(scheduler_runner())
     await dp.start_polling(bot)
 
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Bot stopped")
