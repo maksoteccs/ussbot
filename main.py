@@ -12,7 +12,7 @@ from aiogram.enums import ChatType, MessageEntityType
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-BOT_TOKEN = "8299026874:AAH0uKNWiiqGqi_YQl2SWDhm5qr6Z0Vrxvw"
+BOT_TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН"
 DEFAULT_TZ = "Europe/Moscow"
 DB_PATH = "bot.db"
 
@@ -47,7 +47,7 @@ with closing(sqlite3.connect(DB_PATH)) as conn:
     """)
     conn.commit()
 
-# === DB helpers (исправлено) ===
+# === DB helpers ===
 def db_execute(query: str, params: tuple = ()) -> None:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         c = conn.cursor()
@@ -82,7 +82,8 @@ def attach_username_tasks_to_user(tg_id: int, username: str | None):
     if not username:
         return
     db_execute(
-        "UPDATE tasks SET assignee_tg_id=? WHERE assignee_tg_id IS NULL AND assignee_username=?",
+        "UPDATE tasks SET assignee_tg_id=? "
+        "WHERE assignee_tg_id IS NULL AND assignee_username=?",
         (tg_id, username),
     )
 
@@ -121,11 +122,15 @@ async def cmd_start(message: Message):
     attach_username_tasks_to_user(message.from_user.id, message.from_user.username)
     await message.answer(
         "Привет! Я собираю задачи по @упоминанию и пришлю их тебе утром в 10:00.\n"
-    "Команды: /task, /list, /done &lt;id&gt;"
+        "Команды: /task, /list, /done &lt;id&gt;"
     )
 
 @dp.message(Command("task"))
 async def cmd_task(message: Message, command: CommandObject):
+    # автопривязка username -> tg_id при любом обращении
+    upsert_user(message.from_user.id, message.from_user.username)
+    attach_username_tasks_to_user(message.from_user.id, message.from_user.username)
+
     text = (command.args or "").strip()
     if not text:
         await message.answer("Напиши задачу: /task Текст задачи")
@@ -135,6 +140,9 @@ async def cmd_task(message: Message, command: CommandObject):
 
 @dp.message(Command("list"))
 async def cmd_list(message: Message):
+    upsert_user(message.from_user.id, message.from_user.username)
+    attach_username_tasks_to_user(message.from_user.id, message.from_user.username)
+
     rows = list_tasks_for_user(message.from_user.id)
     if not rows:
         await message.answer("У тебя нет открытых задач ✨")
@@ -144,8 +152,11 @@ async def cmd_list(message: Message):
 
 @dp.message(Command("done"))
 async def cmd_done(message: Message, command: CommandObject):
+    upsert_user(message.from_user.id, message.from_user.username)
+    attach_username_tasks_to_user(message.from_user.id, message.from_user.username)
+
     if not command.args or not command.args.isdigit():
-        await message.answer("Укажи ID задачи: /done 1")
+        await message.answer("Укажи ID задачи: /done &lt;id&gt;")
         return
     ok = mark_done(int(command.args), message.from_user.id)
     await message.answer("Готово ✅" if ok else "Не получилось закрыть задачу")
@@ -155,6 +166,7 @@ async def cmd_done(message: Message, command: CommandObject):
 async def on_group_message(message: Message):
     if not message.text:
         return
+
     entities: list[MessageEntity] = message.entities or []
     mentions = [
         e for e in entities
