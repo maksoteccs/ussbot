@@ -48,14 +48,24 @@ LINKS = [
 # Structure:
 # {
 #   "users": { "<user_id>": {"tasks": [{"text": str, "by": int, "chat": int, "ts": int, "done": bool}] } },
-#   "group_menu_messages": {"<chat_id>": <message_id>}  # to update the single menu message
-# }
+#   "group_menu_messages": {"<chat_id>": <message_id>},
+#   "groups": {"<chat_id>": {"title": str}},
+#   "user_prefs": {"<user_id>": {"current_chat":ata = json.load(f)
+    else:
+        data = {}
+    # ensure keys
+    data.setdefault("users", {})
+    data.setdefault("group_menu_messages", {})
+    data.setdefault("groups", {})
+    data.setdefault("user_prefs", {})
+    return data
 
-def load_db():
-    if DATA_PATH.exists():
-        with open(DATA_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"users": {}, "group_menu_messages": {}}
+
+def save_db(db):
+    with open(DATA_PATH, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+
+
 
 
 def save_db(db):
@@ -64,12 +74,7 @@ def save_db(db):
 
 
 # ========= BOT =========
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-
-bot = Bot(
-    BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 db = load_db()
@@ -81,9 +86,10 @@ ASSIGN_STATE = {}
 
 # ========= KEYBOARDS =========
 
-def main_menu_kb() -> InlineKeyboardMarkup:
+def main_menu_kb_group() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="📌 Назначить задачу", callback_data="assign")
+    kb.button(text="📌 Назначить задачу", callbacу", callback_data="assign")
+    kb.button(text="🏷 Выбрать чат", callback_data="choose_chat")
     kb.button(text="📎 Ссылки", callback_data="links")
     kb.adjust(1)
     return kb.as_markup()
@@ -93,6 +99,13 @@ def links_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for title, url in LINKS:
         kb.row(InlineKeyboardButton(text=title, url=url))
+    kb.row(InlineKeyboardButton(text="↩️ Назад", callback_data="back_main"))
+    return kb.as_markup()
+
+
+def choose_chat_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    groups = db.get("groups"        kb.row(InlineKeyboardButton(text=title, callback_data=f"set_chat:{gid}"))
     kb.row(InlineKeyboardButton(text="↩️ Назад", callback_data="back_main"))
     return kb.as_markup()
 
@@ -131,12 +144,10 @@ async def post_or_update_menu(chat_id: int):
     msg_id = rec.get(str(chat_id))
     if msg_id:
         try:
-            await bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=main_menu_kb())
-            return
-        except Exception:
-            pass
-    sent = await bot.send_message(chat_id, "<b>Меню задач</b> — назначайте задачи через кнопки ниже.", reply_markup=main_menu_kb())
-    rec[str(chat_id)] = sent.message_id
+            await bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=main_menu_kb_group())
+        id)] = sent.message_id
+    # also store group title for private selection
+    db.setdefault("groups", {})[str(chat_id)] = {"title": sent.chat.title or str(chat_id)}
     save_db(db)
 
 
@@ -144,27 +155,9 @@ def add_task(assignee_id: int, text: str, by_user_id: int, chat_id: int):
     u = db.setdefault("users", {}).setdefault(str(assignee_id), {"tasks": []})
     u["tasks"].append({
         "text": text,
-        "by": by_user_id,
-        "chat": chat_id,
-        "ts": int(datetime.now(tz=TZ).timestamp()),
-        "done": False,
-    })
-    save_db(db)
-
-
-def get_active_tasks(user_id: int):
-    u = db.get("users", {}).get(str(user_id), {"tasks": []})
-    return [t for t in u["tasks"] if not t.get("done")]
-
-
-# ========= COMMANDS =========
-
-@dp.message(CommandStart())
-async def on_start(m: Message):
-    if m.chat.type == ChatType.PRIVATE:
-        await m.answer(
-            "Привет! Я бот для задач. Добавь меня в рабочий чат и отправь команду /setupmenu, чтобы я закрепил там кнопки.\n\n"
-            "Задачи назначаются <b>только</b> через меню: сначала выбираешь исполнителя, потом вводишь текст. Всё тихо и без засорения чата.")
+        "by": by_user_idниже.",
+            reply_markup=main_menu_kb_private()
+        )
     else:
         await post_or_update_menu(m.chat.id)
         try:
@@ -182,6 +175,9 @@ async def setup_menu(m: Message):
         await m.answer("Этот чат не разрешен для меню.")
         return
     await post_or_update_menu(m.chat.id)
+    # store/refresh group title
+    db.setdefault("groups", {})[str(m.chat.id)] = {"title": m.chat.title or str(m.chat.id)}
+    save_db(db)
     try:
         await m.delete()
     except Exception:
@@ -193,9 +189,10 @@ async def setup_menu(m: Message):
 @dp.callback_query(F.data == "assign")
 async def cb_assign(c: CallbackQuery):
     chat = c.message.chat
-    # Start assignment flow in current chat
-    ASSIGN_STATE[c.from_user.id] = {"chat_id": chat.id, "assignee_id": None}
-    await c.answer("Выбор исполнителя…", show_alert=False)
+    # Determine target chat: in private — from user prefs; in group — current chat
+    target_chat_id = chat.id
+    if chat.type == ChatType.PRIVATE:
+        prefs = db.get("user_prefs", {}).get(str(c.from_useтеля…", show_alert=False)
     await bot.send_message(chat.id,
         f"{c.from_user.full_name}, выбери исполнителя ⤵️",
         reply_markup=user_picker_reply_kb())
@@ -207,32 +204,21 @@ async def cb_links(c: CallbackQuery):
     await c.answer()
 
 
-@dp.callback_query(F.data == "back_main")
-async def cb_back(c: CallbackQuery):
-    await c.message.edit_text("<b>Меню задач</b> — назначайте задачи через кнопки ниже.", reply_markup=main_menu_kb())
+@dp.callback_query(F.data == "choose_chat")
+async def it_text(f"<b>Меню задач</b> — выбран чат: <i>{title}</i>", reply_markup=main_menu_kb_private())
+    await c.answer("Чат выбран")
+async def cb_links(c: CallbackQuery):
+    await c.message.edit_text("Полезные ссылки:", reply_markup=links_kb())
     await c.answer()
 
 
-# ========= USER PICKER HANDLER =========
-# Works when someone presses the reply keyboard button with request_user
-
-@dp.message(F.user_shared)
-async def on_user_shared(m: Message):
-    shared: UserShared = m.user_shared
-    state = ASSIGN_STATE.get(m.from_user.id)
-    if not state:
-        # Not in flow — ignore and remove the keyboard
-        await m.answer("Выбор исполнителя вне контекста меню.", reply_markup=ReplyKeyboardRemove())
-        try:
-            await m.delete()
-        except Exception:
-            pass
-        return
-
-    assignee_id = shared.user_id
-    chat_id = state["chat_id"]
-
-    # Enforce membership: only users from THIS chat can be assigned
+@dp.callback_query(F.data == "back_main")
+async def cb_back(c: CallbackQuery):
+    if c.message.chat.type == ChatType.PRIVATE:
+        await c.message.edit_text("<b>Меню задач</b> — назначайте задачи через кнопки ниже.", reply_markup=main_menu_kb_private())
+    else:
+        await c.message.edit_text("<b>Меню задач</b> — назначайте задачи через кнопки ниже.", reply_markup=main_menu_kb_group())
+    await c.aned
     if not await is_chat_member(chat_id, assignee_id):
         # Inform selector privately and clean message
         try:
@@ -266,18 +252,7 @@ async def on_user_shared(m: Message):
 @dp.message(F.reply_to_message, F.reply_to_message.text.contains("Напиши текст задачи"))
 async def on_task_text(m: Message):
     state = ASSIGN_STATE.get(m.from_user.id)
-    if not state or not state.get("assignee_id"):
-        try:
-            await m.delete()
-        except Exception:
-            pass
-        return
-
-    assignee_id = state["assignee_id"]
-    chat_id = state["chat_id"]
-    text = m.text.strip()
-
-    add_task(assignee_id, text, by_user_id=m.from_user.id, chat_id=chat_id)
+    if not state or not state.    add_task(assignee_id, text, by_user_id=m.from_user.id, chat_id=chat_id)
 
     # DM assignee and creator
     try:
