@@ -1,6 +1,4 @@
-# === Импорты и настройки ===
 import asyncio
-import os
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
@@ -20,7 +18,6 @@ DB_PATH = "bot.db"
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-# === База данных ===
 with closing(sqlite3.connect(DB_PATH)) as conn:
     c = conn.cursor()
     c.execute("""
@@ -45,7 +42,6 @@ with closing(sqlite3.connect(DB_PATH)) as conn:
     """)
     conn.commit()
 
-# === DB-хелперы ===
 def db_exec(query, params=()):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
@@ -55,11 +51,12 @@ def db_exec(query, params=()):
         return c
 
 def upsert_user(tg_id, username):
-    db_exec(
-        """INSERT INTO users (tg_id, username, tz) VALUES (?, ?, ?)
-           ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username""",
-        (tg_id, username, DEFAULT_TZ)
-    )
+    row = db_exec("SELECT tg_id FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+    if row:
+        db_exec("UPDATE users SET username=? WHERE tg_id=?", (username, tg_id))
+    else:
+        db_exec("INSERT INTO users (tg_id, username, tz, weekdays_only) VALUES (?, ?, ?, 1)",
+                (tg_id, username, DEFAULT_TZ))
 
 def add_task(assignee_tg_id, assignee_username, chat_id, text):
     db_exec(
@@ -75,12 +72,13 @@ def list_tasks_for_user(tg_id):
 
 def mark_done(task_id, tg_id):
     row = db_exec("SELECT assignee_tg_id FROM tasks WHERE id=?", (task_id,)).fetchone()
-    if not row: return False
-    if row["assignee_tg_id"] and row["assignee_tg_id"] != tg_id: return False
+    if not row:
+        return False
+    if row["assignee_tg_id"] and row["assignee_tg_id"] != tg_id:
+        return False
     db_exec("UPDATE tasks SET is_done=1 WHERE id=?", (task_id,))
     return True
 
-# === Команды ===
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     upsert_user(message.from_user.id, message.from_user.username)
@@ -104,7 +102,7 @@ async def cmd_list(message: Message):
     lines = [f"{r['id']}. {r['text']}" for r in rows]
     await message.answer("Твои задачи:\n" + "\n".join(lines))
 
-@dp.message(Command("done"))
+@dp.message(Command("done")))
 async def cmd_done(message: Message, command: CommandObject):
     if not command.args or not command.args.isdigit():
         await message.answer("Укажи ID задачи: /done 1")
@@ -112,18 +110,21 @@ async def cmd_done(message: Message, command: CommandObject):
     ok = mark_done(int(command.args), message.from_user.id)
     await message.answer("Готово ✅" if ok else "Не получилось закрыть задачу")
 
-# === Обработчик сообщений в группах (по упоминанию) ===
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def on_group_message(message: Message):
-    if not message.text: return
-    mentions = [e for e in (message.entities or []) if e.type in {MessageEntityType.MENTION, MessageEntityType.TEXT_MENTION}]
-    if not mentions: return
+    if not message.text:
+        return
+    entities = message.entities or []
+    mentions = [e for e in entities if e.type in {MessageEntityType.MENTION, MessageEntityType.TEXT_MENTION}]
+    if not mentions:
+        return
 
     text = message.text
     for e in mentions:
         if e.offset == 0:
             text = text[e.length:].strip()
-    if not text: return
+    if not text:
+        return
 
     for e in mentions:
         assignee_tg_id = None
@@ -132,27 +133,29 @@ async def on_group_message(message: Message):
             assignee_tg_id = e.user.id
             assignee_username = e.user.username
         else:
-            assignee_username = message.text[e.offset+1:e.offset+e.length]
+            assignee_username = message.text[e.offset + 1 : e.offset + e.length]
         add_task(assignee_tg_id, assignee_username, message.chat.id, text)
 
     await message.reply("Задача(и) добавлена(ы) ✅")
 
-# === Ежедневные напоминания ===
 async def send_daily_summaries():
     rows = db_exec("""
-        SELECT DISTINCT u.tg_id FROM tasks t
+        SELECT DISTINCT u.tg_id
+        FROM tasks t
         JOIN users u ON u.tg_id = t.assignee_tg_id
-        WHERE t.is_done=0
+        WHERE t.is_done=0 AND t.assignee_tg_id IS NOT NULL
     """).fetchall()
     for r in rows:
         tg_id = r["tg_id"]
         tasks = list_tasks_for_user(tg_id)
-        if not tasks: continue
+        if not tasks:
+            continue
         lines = [f"{row['id']}. {row['text']}" for row in tasks]
         text = "Доброе утро! Твои задачи:\n" + "\n".join(lines)
         try:
             await bot.send_message(chat_id=tg_id, text=text)
-        except: pass
+        except:
+            pass
 
 def schedule_jobs(scheduler: AsyncIOScheduler):
     scheduler.add_job(
@@ -162,7 +165,6 @@ def schedule_jobs(scheduler: AsyncIOScheduler):
         replace_existing=True
     )
 
-# === Запуск ===
 async def main():
     scheduler = AsyncIOScheduler(timezone=ZoneInfo(DEFAULT_TZ))
     schedule_jobs(scheduler)
