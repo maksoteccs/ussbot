@@ -18,11 +18,11 @@ DB_PATH = "bot.db"
 
 bot = Bot(
     token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode="HTML")
+    default=DefaultBotProperties(parse_mode="HTML"),
 )
 dp = Dispatcher()
 
-# === Инициализация базы данных ===
+# === Инициализация БД ===
 with closing(sqlite3.connect(DB_PATH)) as conn:
     c = conn.cursor()
     c.execute("""
@@ -47,35 +47,47 @@ with closing(sqlite3.connect(DB_PATH)) as conn:
     """)
     conn.commit()
 
-# === DB-функции ===
-def db_exec(query, params=()):
+# === DB helpers (исправлено) ===
+def db_execute(query: str, params: tuple = ()) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute(query, params)
+        conn.commit()
+
+def db_fetchone(query: str, params: tuple = ()):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         c.execute(query, params)
-        conn.commit()
-        return c
+        return c.fetchone()
 
-def upsert_user(tg_id, username):
-    row = db_exec("SELECT tg_id FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+def db_fetchall(query: str, params: tuple = ()):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute(query, params)
+        return c.fetchall()
+
+def upsert_user(tg_id: int, username: str | None):
+    row = db_fetchone("SELECT tg_id FROM users WHERE tg_id=?", (tg_id,))
     if row:
-        db_exec("UPDATE users SET username=? WHERE tg_id=?", (username, tg_id))
+        db_execute("UPDATE users SET username=? WHERE tg_id=?", (username, tg_id))
     else:
-        db_exec(
+        db_execute(
             "INSERT INTO users (tg_id, username, tz, weekdays_only) VALUES (?, ?, ?, 1)",
             (tg_id, username, DEFAULT_TZ),
         )
 
-def attach_username_tasks_to_user(tg_id, username):
+def attach_username_tasks_to_user(tg_id: int, username: str | None):
     if not username:
         return
-    db_exec(
+    db_execute(
         "UPDATE tasks SET assignee_tg_id=? WHERE assignee_tg_id IS NULL AND assignee_username=?",
         (tg_id, username),
     )
 
-def add_task(assignee_tg_id, assignee_username, chat_id, text):
-    db_exec(
+def add_task(assignee_tg_id: int | None, assignee_username: str | None, chat_id: int, text: str):
+    db_execute(
         "INSERT INTO tasks (assignee_tg_id, assignee_username, chat_id, text, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (
@@ -87,19 +99,19 @@ def add_task(assignee_tg_id, assignee_username, chat_id, text):
         ),
     )
 
-def list_tasks_for_user(tg_id):
-    return db_exec(
+def list_tasks_for_user(tg_id: int):
+    return db_fetchall(
         "SELECT id, text FROM tasks WHERE is_done=0 AND assignee_tg_id=? ORDER BY id ASC",
         (tg_id,),
-    ).fetchall()
+    )
 
-def mark_done(task_id, tg_id):
-    row = db_exec("SELECT assignee_tg_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+def mark_done(task_id: int, tg_id: int) -> bool:
+    row = db_fetchone("SELECT assignee_tg_id FROM tasks WHERE id=?", (task_id,))
     if not row:
         return False
     if row["assignee_tg_id"] and row["assignee_tg_id"] != tg_id:
         return False
-    db_exec("UPDATE tasks SET is_done=1 WHERE id=?", (task_id,))
+    db_execute("UPDATE tasks SET is_done=1 WHERE id=?", (task_id,))
     return True
 
 # === Команды ===
@@ -138,7 +150,7 @@ async def cmd_done(message: Message, command: CommandObject):
     ok = mark_done(int(command.args), message.from_user.id)
     await message.answer("Готово ✅" if ok else "Не получилось закрыть задачу")
 
-# === Обработчик групповых сообщений (упоминания) ===
+# === Группы: добавление задач по упоминанию ===
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def on_group_message(message: Message):
     if not message.text:
@@ -172,12 +184,12 @@ async def on_group_message(message: Message):
 
 # === Ежедневные напоминания ===
 async def send_daily_summaries():
-    rows = db_exec("""
+    rows = db_fetchall("""
         SELECT DISTINCT u.tg_id
         FROM tasks t
         JOIN users u ON u.tg_id = t.assignee_tg_id
         WHERE t.is_done=0 AND t.assignee_tg_id IS NOT NULL
-    """).fetchall()
+    """)
     for r in rows:
         tg_id = r["tg_id"]
         tasks = list_tasks_for_user(tg_id)
