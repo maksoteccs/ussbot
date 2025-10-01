@@ -11,7 +11,7 @@ Telegram Task Bot — aiogram 3.7+ + APScheduler + sqlite3 (async via asyncio.to
 - Ежедневные напоминания по будням в 10:00 (Europe/Stockholm).
 
 ENV (.env рядом с main.py):
-BOT_TOKEN=123456:ABC...
+BOT_TOKEN=8299026874:AAH0uKNWiiqGqi_YQl2SWDhm5qr6Z0Vrxvw.
 TZ=Europe/Stockholm
 
 Зависимости:
