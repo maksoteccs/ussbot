@@ -121,7 +121,7 @@ async def cmd_start(message: Message):
     attach_username_tasks_to_user(message.from_user.id, message.from_user.username)
     await message.answer(
         "Привет! Я собираю задачи по @упоминанию и пришлю их тебе утром в 10:00.\n"
-        "Команды: /task, /list, /done <id>"
+    "Команды: /task, /list, /done &lt;id&gt;"
     )
 
 @dp.message(Command("task"))
