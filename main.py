@@ -1,9 +1,10 @@
-# bot.py
+# main.py
 # Python 3.11+
 
 import asyncio
 import json
 import os
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -22,13 +23,19 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 
-# ========= CONFIG =========
+# ---------- logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+log = logging.getLogger("ussbot")
+
+# ---------- config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TZ = pytz.timezone("Europe/Stockholm")
 DATA_PATH = Path("tasks.json")
 
-# ========= STORAGE =========
-
+# ---------- storage ----------
 def load_db():
     if DATA_PATH.exists():
         with open(DATA_PATH, "r", encoding="utf-8") as f:
@@ -38,25 +45,27 @@ def load_db():
     data.setdefault("users", {})
     data.setdefault("group_menu_messages", {})
     data.setdefault("groups", {})
-    for gid, meta in list(data.get("groups", {}).items()):
+    for _, meta in list(data.get("groups", {}).items()):
         meta.setdefault("members", {})
     data.setdefault("user_prefs", {})
     return data
-
 
 def save_db(db):
     with open(DATA_PATH, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
 
-# ========= BOT =========
+db = load_db()
+
+# ---------- bot ----------
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN не задан. Экспортируй переменную окружения BOT_TOKEN и запусти снова.")
+
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-db = load_db()
 ASSIGN_STATE = {}
 
-# ========= KEYBOARDS =========
-
+# ---------- keyboards ----------
 def main_menu_kb_group() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📌 Назначить задачу", callback_data="assign")
@@ -64,7 +73,6 @@ def main_menu_kb_group() -> InlineKeyboardMarkup:
     kb.button(text="📎 Ссылки", callback_data="links")
     kb.adjust(1)
     return kb.as_markup()
-
 
 def main_menu_kb_private() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -75,14 +83,14 @@ def main_menu_kb_private() -> InlineKeyboardMarkup:
     kb.adjust(1)
     return kb.as_markup()
 
-
 def links_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    # добавь свои ссылки тут, напр.:
+    # for title, url in [("План", "https://...")]:
     for title, url in []:
         kb.row(InlineKeyboardButton(text=title, url=url))
     kb.row(InlineKeyboardButton(text="↩️ Назад", callback_data="back_main"))
     return kb.as_markup()
-
 
 def choose_chat_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -96,8 +104,7 @@ def choose_chat_kb() -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="↩️ Назад", callback_data="back_main"))
     return kb.as_markup()
 
-# ========= HELPERS =========
-
+# ---------- helpers ----------
 def assign_list_kb(chat_id: int) -> InlineKeyboardMarkup:
     members = db.get("groups", {}).get(str(chat_id), {}).get("members", {})
     items = [
@@ -116,7 +123,6 @@ def assign_list_kb(chat_id: int) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="↩️ Назад", callback_data="back_main"))
     return kb.as_markup()
 
-
 async def is_chat_member(chat_id: int, user_id: int) -> bool:
     try:
         cm = await bot.get_chat_member(chat_id, user_id)
@@ -124,14 +130,12 @@ async def is_chat_member(chat_id: int, user_id: int) -> bool:
     except Exception:
         return False
 
-
 async def is_admin(chat_id: int, user_id: int) -> bool:
     try:
         cm = await bot.get_chat_member(chat_id, user_id)
         return cm.status in {"creator", "administrator"}
     except Exception:
         return False
-
 
 def add_task(assignee_id: int, text: str, by_user_id: int, chat_id: int):
     u = db.setdefault("users", {}).setdefault(str(assignee_id), {"tasks": []})
@@ -144,14 +148,11 @@ def add_task(assignee_id: int, text: str, by_user_id: int, chat_id: int):
     })
     save_db(db)
 
-
 def get_active_tasks(user_id: int):
     u = db.get("users", {}).get(str(user_id), {"tasks": []})
     return [t for t in u["tasks"] if not t.get("done")]
 
-
 async def post_or_update_menu(chat_id: int):
-    """Публикует или обновляет единое сообщение-меню в группе."""
     rec = db.setdefault("group_menu_messages", {})
     msg_id = rec.get(str(chat_id))
     if msg_id:
@@ -160,33 +161,33 @@ async def post_or_update_menu(chat_id: int):
             return
         except Exception:
             pass
-    sent = await bot.send_message(chat_id, "<b>Меню задач</b> — назначайте задачи через кнопки ниже.", reply_markup=main_menu_kb_group())
+    sent = await bot.send_message(
+        chat_id,
+        "<b>Меню задач</b> — назначайте задачи через кнопки ниже.",
+        reply_markup=main_menu_kb_group()
+    )
     rec[str(chat_id)] = sent.message_id
     g = db.setdefault("groups", {}).setdefault(str(chat_id), {})
     g["title"] = sent.chat.title or str(chat_id)
     g.setdefault("members", {})
     save_db(db)
 
-
-def post_cta_message_markup(chat_id: int) -> InlineKeyboardMarkup:
+def cta_markup(chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Я могу записывать тебе задачи", callback_data=f"iamhere:{chat_id}")
     ]])
 
-
-async def post_cta_message(chat_id: int):
-    """Публикует CTA для саморегистрации участников — без админских прав."""
+async def post_cta(chat_id: int):
     try:
         await bot.send_message(
             chat_id,
             "Я могу записывать тебе задачи. Нажми кнопку ниже, чтобы добавиться в список исполнителей этого чата и получать личные напоминания.",
-            reply_markup=post_cta_message_markup(chat_id)
+            reply_markup=cta_markup(chat_id)
         )
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("CTA post failed: %s", e)
 
-# ========= CALLBACKS =========
-
+# ---------- callbacks ----------
 @dp.callback_query(F.data == "assign")
 async def cb_assign(c: CallbackQuery):
     chat = c.message.chat
@@ -202,18 +203,15 @@ async def cb_assign(c: CallbackQuery):
     await c.answer("Выбор исполнителя…")
     await bot.send_message(chat.id, "Выбери исполнителя:", reply_markup=assign_list_kb(int(target_chat_id)))
 
-
 @dp.callback_query(F.data == "links")
 async def cb_links(c: CallbackQuery):
     await c.message.edit_text("Полезные ссылки:", reply_markup=links_kb())
     await c.answer()
 
-
 @dp.callback_query(F.data == "choose_chat")
 async def cb_choose_chat(c: CallbackQuery):
     await c.message.edit_text("Выбери рабочий чат:", reply_markup=choose_chat_kb())
     await c.answer()
-
 
 @dp.callback_query(F.data.startswith("set_chat:"))
 async def cb_set_chat(c: CallbackQuery):
@@ -223,7 +221,6 @@ async def cb_set_chat(c: CallbackQuery):
     title = db.get("groups", {}).get(str(chat_id), {}).get("title", str(chat_id))
     await c.message.edit_text(f"<b>Меню задач</b> — выбран чат: <i>{title}</i>", reply_markup=main_menu_kb_private())
     await c.answer("Чат выбран")
-
 
 @dp.callback_query(F.data == "refresh_members")
 async def cb_refresh_members(c: CallbackQuery):
@@ -246,13 +243,11 @@ async def cb_refresh_members(c: CallbackQuery):
                 g["members"][str(u.id)] = {"name": u.full_name, "is_bot": u.is_bot}
                 added += 1
         save_db(db)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("get_chat_administrators failed: %s", e)
 
-    # Постим CTA, чтобы молчуны добавили себя сами
-    await post_cta_message(chat.id)
+    await post_cta(chat.id)
     await c.answer(f"Обновлено админов: +{added}. Отправил сообщение с кнопкой для участников.", show_alert=True)
-
 
 @dp.callback_query(F.data.startswith("iamhere:"))
 async def cb_iamhere(c: CallbackQuery):
@@ -265,7 +260,6 @@ async def cb_iamhere(c: CallbackQuery):
     save_db(db)
     await c.answer("Готово: вы добавлены в список исполнителей.", show_alert=True)
 
-
 @dp.callback_query(F.data == "back_main")
 async def cb_back(c: CallbackQuery):
     if c.message.chat.type == ChatType.PRIVATE:
@@ -273,7 +267,6 @@ async def cb_back(c: CallbackQuery):
     else:
         await c.message.edit_text("<b>Меню задач</b> — назначайте задачи через кнопки ниже.", reply_markup=main_menu_kb_group())
     await c.answer()
-
 
 @dp.message(F.reply_to_message, F.reply_to_message.text.contains("Напиши текст задачи"))
 async def on_task_text(m: Message):
@@ -286,16 +279,15 @@ async def on_task_text(m: Message):
     add_task(assignee_id, text, m.from_user.id, chat_id)
     try:
         await bot.send_message(assignee_id, f"🆕 Новая задача: {text}")
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("DM assignee failed: %s", e)
     try:
         await bot.send_message(m.from_user.id, f"✅ Задача назначена пользователю {assignee_id}: {text}")
     except Exception:
         pass
     ASSIGN_STATE.pop(m.from_user.id, None)
 
-# ========= REMINDERS =========
-
+# ---------- reminders ----------
 async def send_daily_reminders():
     now = datetime.now(TZ)
     if now.weekday() >= 5:
@@ -307,18 +299,17 @@ async def send_daily_reminders():
         text = "🗓 <b>Ежедневное напоминание</b>\n" + "\n".join(f"{i+1}. {t['text']}" for i, t in enumerate(tasks))
         try:
             await bot.send_message(int(uid), text)
-        except Exception:
-            pass
-
+        except Exception as e:
+            log.warning("Reminder DM failed: %s", e)
 
 async def scheduler_runner():
     sched = AsyncIOScheduler(timezone=str(TZ))
     trigger = CronTrigger(day_of_week="mon-fri", hour=10, minute=0)
     sched.add_job(send_daily_reminders, trigger)
     sched.start()
+    log.info("Scheduler started for 10:00 Europe/Stockholm on weekdays")
 
-# ========= STARTUP =========
-
+# ---------- startup ----------
 @dp.chat_member()
 async def on_chat_member(event: ChatMemberUpdated):
     chat = event.chat
@@ -334,10 +325,8 @@ async def on_chat_member(event: ChatMemberUpdated):
         members[str(user.id)] = {"name": user.full_name, "is_bot": user.is_bot}
     save_db(db)
 
-
 @dp.my_chat_member()
 async def on_my_chat_member(event: ChatMemberUpdated):
-    """Когда бота добавили в чат — публикуем меню и CTA для саморегистрации."""
     chat = event.chat
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
@@ -346,24 +335,27 @@ async def on_my_chat_member(event: ChatMemberUpdated):
     except Exception:
         new_status = None
     if str(new_status) in {"administrator", "member"}:
-        # Сохраняем заголовок чата
         db.setdefault("groups", {}).setdefault(str(chat.id), {}).update({"title": chat.title or str(chat.id)})
         db["groups"][str(chat.id)].setdefault("members", {})
         save_db(db)
-        # Публикуем меню и CTA
         await post_or_update_menu(chat.id)
-        await post_cta_message(chat.id)
+        await post_cta(chat.id)
+        log.info("Initialized chat %s (%s): menu + CTA posted", chat.id, chat.title)
 
 @dp.message(F.chat.type == ChatType.PRIVATE)
 async def on_private(m: Message):
     await m.answer("<b>Меню задач</b>", reply_markup=main_menu_kb_private())
 
 async def main():
+    log.info("Starting bot…")
     asyncio.create_task(scheduler_runner())
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        log.exception("Polling crashed: %s", e)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        print("Bot stopped")
+        log.info("Bot stopped")
