@@ -1,10 +1,10 @@
 """
-Telegram Task Bot — fresh start (aiogram 2.x)
+Telegram Task Bot — fresh start (aiogram 2.x, sqlite3-sync via asyncio.to_thread)
 
-Сохраняем твои требования:
+Требования:
 - Никаких сообщений в общий чат.
-- Назначение задачи делается в общем чате по реплаю и сразу уходит в ЛС исполнителю и инициатору.
-- /menu и другие команды, если вызваны в группе, удаляются и ответ уходит в ЛС.
+- Назначение задачи делается в общем чате по реплаю; подтверждение и задача уходят в ЛС исполнителю и инициатору.
+- /menu, /mytasks, /done в группе удаляются; ответы — в ЛС.
 - Ежедневные напоминания в 10:00 по будням (Europe/Stockholm).
 
 ENV:
@@ -15,18 +15,17 @@ TZ=Europe/Stockholm
 aiogram==2.25.1
 APScheduler==3.10.4
 python-dotenv==1.0.1
-aiosqlite==0.20.0
 pytz==2024.1
 """
 
 import asyncio
 import logging
 import os
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, List, Tuple
 
-import aiosqlite
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -57,52 +56,79 @@ logger = logging.getLogger("ussbot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
 # -------------------------------------------------
-# Data layer (SQLite)
+# Data layer (SQLite, sync -> run in thread)
 # -------------------------------------------------
 DB_PATH = "tasks.db"
 
-CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    assigner_id INTEGER NOT NULL,
-    assignee_id INTEGER NOT NULL,
-    text TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    due_date TEXT,
-    is_done INTEGER NOT NULL DEFAULT 0
-);
-"""
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+def _init_db_sync():
+    with _connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                assigner_id INTEGER NOT NULL,
+                assignee_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                due_date TEXT,
+                is_done INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        conn.commit()
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(CREATE_TABLE_SQL)
-        await db.commit()
+    await asyncio.to_thread(_init_db_sync)
 
-async def add_task(chat_id: int, assigner_id: int, assignee_id: int, text: str, due_date: Optional[str] = None) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
+def _add_task_sync(chat_id: int, assigner_id: int, assignee_id: int, text: str, due_date: Optional[str]) -> int:
+    with _connect() as conn:
+        cur = conn.execute(
             "INSERT INTO tasks (chat_id, assigner_id, assignee_id, text, created_at, due_date, is_done) "
             "VALUES (?,?,?,?,?,?,0)",
             (chat_id, assigner_id, assignee_id, text.strip(), datetime.utcnow().isoformat(), due_date),
         )
-        await db.commit()
+        conn.commit()
         return cur.lastrowid
 
-async def list_tasks_for_assignee(assignee_id: int, only_open: bool = True) -> List[Tuple]:
+async def add_task(chat_id: int, assigner_id: int, assignee_id: int, text: str, due_date: Optional[str] = None) -> int:
+    return await asyncio.to_thread(_add_task_sync, chat_id, assigner_id, assignee_id, text, due_date)
+
+def _list_tasks_for_assignee_sync(assignee_id: int, only_open: bool) -> List[Tuple]:
     q = "SELECT id, chat_id, text, created_at, due_date, is_done FROM tasks WHERE assignee_id=?"
+    params = [assignee_id]
     if only_open:
         q += " AND is_done=0"
     q += " ORDER BY id DESC"
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(q, (assignee_id,))
-        return await cur.fetchall()
+    with _connect() as conn:
+        cur = conn.execute(q, params)
+        return cur.fetchall()
+
+async def list_tasks_for_assignee(assignee_id: int, only_open: bool = True) -> List[Tuple]:
+    return await asyncio.to_thread(_list_tasks_for_assignee_sync, assignee_id, only_open)
+
+def _mark_done_sync(task_id: int) -> bool:
+    with _connect() as conn:
+        cur = conn.execute("UPDATE tasks SET is_done=1 WHERE id=?", (task_id,))
+        conn.commit()
+        return cur.rowcount > 0
 
 async def mark_done(task_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("UPDATE tasks SET is_done=1 WHERE id=?", (task_id,))
-        await db.commit()
-        return cur.rowcount > 0
+    return await asyncio.to_thread(_mark_done_sync, task_id)
+
+def _distinct_open_assignees_sync() -> List[int]:
+    with _connect() as conn:
+        cur = conn.execute("SELECT DISTINCT assignee_id FROM tasks WHERE is_done=0")
+        return [row[0] for row in cur.fetchall()]
+
+async def distinct_open_assignees() -> List[int]:
+    return await asyncio.to_thread(_distinct_open_assignees_sync)
 
 # -------------------------------------------------
 # Bot setup
@@ -289,7 +315,6 @@ async def cmd_done(message: types.Message):
         await safe_delete(message)
         uid = message.from_user.id
         args = message.get_args().strip()
-        # Получить аргументы из группы невозможно после удаления; просим повторить в ЛС
         try:
             if not args:
                 await bot.send_message(uid, "Укажите ID задачи: /done <id>")
@@ -317,7 +342,7 @@ async def cmd_done(message: types.Message):
         pass
 
 # -------------------------------------------------
-# Callbacks (menu buttons) — работают в ЛС
+# Callbacks (menu buttons)
 # -------------------------------------------------
 @dp.callback_query_handler(lambda c: c.data == "menu_assign")
 async def cb_menu_assign(call: types.CallbackQuery):
@@ -355,10 +380,7 @@ async def cb_menu_mytasks(call: types.CallbackQuery):
 # Scheduler: daily reminders @ 10:00 Europe/Stockholm (Mon-Fri)
 # -------------------------------------------------
 async def send_daily_reminders():
-    # Собираем всех исполнителей с открытыми задачами и отправляем общий список в ЛС
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT DISTINCT assignee_id FROM tasks WHERE is_done=0")
-        assignees = [row[0] for row in await cur.fetchall()]
+    assignees = await distinct_open_assignees()
     if not assignees:
         return
 
@@ -380,7 +402,7 @@ scheduler: Optional[AsyncIOScheduler] = None
 async def on_startup(dispatcher: Dispatcher):
     await init_db()
 
-    # Команды для приватных и групповых чатов
+    # Команды
     commands = [
         BotCommand("menu", "Открыть меню"),
         BotCommand("assign", "Назначить задачу (в группе по реплаю)"),
@@ -393,7 +415,6 @@ async def on_startup(dispatcher: Dispatcher):
     global scheduler
     if scheduler is None:
         scheduler = AsyncIOScheduler(timezone=ctx.tz)
-        # 10:00 Mon-Fri
         trigger = CronTrigger(day_of_week="mon-fri", hour=10, minute=0, timezone=ctx.tz)
         scheduler.add_job(lambda: asyncio.create_task(send_daily_reminders()), trigger)
         scheduler.start()
