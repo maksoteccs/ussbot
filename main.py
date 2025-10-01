@@ -64,7 +64,12 @@ def save_db(db):
 
 
 # ========= BOT =========
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 db = load_db()
