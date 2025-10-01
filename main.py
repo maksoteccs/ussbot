@@ -45,7 +45,9 @@ from aiogram.types import (
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
 )
-from aiogram.utils.markdown import quote_html
+import html
+def quote_html(text: str) -> str:
+    return html.escape(text, quote=True)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # -------------------------------------------------
